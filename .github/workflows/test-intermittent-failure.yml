@@ -1,0 +1,325 @@
+name: Test Intermittent Failure
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_runs:
+        description: 'Number of test runs'
+        required: false
+        default: '100'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: Linux-cargo-amd64
+          
+      - uses: dsherret/rust-toolchain-file@v1
+      
+      - name: Build Nydus
+        run: |
+          make release
+          
+      - name: Build Nydusify
+        run: |
+          make -e DOCKER=false contrib-release
+          
+      - name: Prepare Older Binaries
+        run: |
+          # 下载 v0.1.0 版本 (最容易失败的版本)
+          wget -q https://github.com/dragonflyoss/nydus/releases/download/v0.1.0/nydus-static-v0.1.0-x86_64.tgz
+          sudo mkdir -p nydus-v0.1.0 /usr/bin/nydus-v0.1.0
+          sudo tar xzf nydus-static-v0.1.0-x86_64.tgz -C nydus-v0.1.0
+          sudo cp -r nydus-v0.1.0/nydus-static/* /usr/bin/nydus-v0.1.0/
+          
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.work'
+          cache-dependency-path: "**/*.sum"
+          
+      - name: Prepare Test Environment
+        run: |
+          sudo mkdir -p /usr/bin/nydus-latest /home/runner/work/workdir
+          sudo install -D -m 755 contrib/nydusify/cmd/nydusify /usr/bin/nydus-latest/
+          sudo install -D -m 755 target/release/nydusd target/release/nydus-image /usr/bin/nydus-latest/
+          sudo bash misc/prepare.sh
+          
+      - name: Build Test Binary
+        run: |
+          cd smoke
+          go test -o smoke.test -c -race -v ./tests
+          
+      - name: Run Intermittent Failure Test
+        id: test
+        continue-on-error: true
+        run: |
+          RESULT_DIR="${GITHUB_WORKSPACE}/test-results"
+          mkdir -p "$RESULT_DIR"
+          
+          export NYDUS_BUILDER=/usr/bin/nydus-latest/nydus-image
+          export NYDUS_NYDUSD=/usr/bin/nydus-latest/nydusd
+          export NYDUS_NYDUSIFY=/usr/bin/nydus-latest/nydusify
+          export NYDUS_NYDUSD_v0_1_0=/usr/bin/nydus-v0.1.0/nydusd
+          export NYDUS_BUILDER_v0_1_0=/usr/bin/nydus-v0.1.0/nydus-image
+          export NYDUS_NYDUSIFY_v0_1_0=/usr/bin/nydus-v0.1.0/nydusify
+          export DISABLE_REGISTRY=1
+          
+          cd smoke
+          
+          TOTAL_RUNS=${{ github.event.inputs.test_runs }}
+          # 70% 测试 v0.1.0 (问题版本), 30% 测试 latest (修复版本)
+          V0_RUNS=$((TOTAL_RUNS * 70 / 100))
+          LATEST_RUNS=$((TOTAL_RUNS - V0_RUNS))
+          
+          echo "========================================="
+          echo "间歇性失败对比测试"
+          echo "========================================="
+          echo "总运行次数: $TOTAL_RUNS"
+          echo "  - v0.1.0 (问题版本):  $V0_RUNS 次 (70%)"
+          echo "  - latest (修复版本):  $LATEST_RUNS 次 (30%)"
+          echo "目标配置: enable_prefetch=true + rafs_mode=direct"
+          echo "========================================="
+          echo ""
+          
+          START=$(date +%s)
+          
+          # ========== 测试 v0.1.0 (问题版本) ==========
+          echo "### 测试 v0.1.0 (问题版本，未修复)"
+          echo ""
+          
+          V0_FAILED=0
+          V0_SUCCESS=0
+          
+          for i in $(seq 1 $V0_RUNS); do
+            echo "[v0.1.0: $i/$V0_RUNS] 测试中..."
+            
+            if sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=16 \
+              -test.run "TestNativeLayer/.*enable_prefetch=true.*nydusd_version=v0.1.0.*rafs_mode=direct" \
+              &> /tmp/test_v0_$i.log; then
+              V0_SUCCESS=$((V0_SUCCESS + 1))
+              echo "  ✅ 成功 (累计: 成功=$V0_SUCCESS, 失败=$V0_FAILED)"
+            else
+              V0_FAILED=$((V0_FAILED + 1))
+              echo "  ❌ 失败 (累计: 成功=$V0_SUCCESS, 失败=$V0_FAILED)"
+              cp /tmp/test_v0_$i.log "$RESULT_DIR/failed_v0_$i.log"
+              
+              # 提取错误类型
+              if grep -q "input/output error" /tmp/test_v0_$i.log; then
+                echo "     错误类型: input/output error"
+              elif grep -q "Not equal" /tmp/test_v0_$i.log; then
+                echo "     错误类型: hash mismatch"
+              fi
+            fi
+            
+            # 每10次输出进度
+            if [ $((i % 10)) -eq 0 ]; then
+              FAIL_RATE=$(awk "BEGIN {printf \"%.1f\", ($V0_FAILED/$i)*100}")
+              echo "  📊 进度: $i/$V0_RUNS | 失败: $V0_FAILED | 失败率: $FAIL_RATE%"
+            fi
+          done
+          
+          V0_FAIL_RATE=$(awk "BEGIN {printf \"%.2f\", ($V0_FAILED/$V0_RUNS)*100}")
+          echo ""
+          echo "v0.1.0 测试完成: 成功=$V0_SUCCESS, 失败=$V0_FAILED, 失败率=$V0_FAIL_RATE%"
+          echo ""
+          
+          # ========== 测试 latest (修复版本) ==========
+          echo "### 测试 latest (修复版本，已应用 WaitForPrefetchComplete)"
+          echo ""
+          
+          LATEST_FAILED=0
+          LATEST_SUCCESS=0
+          
+          for i in $(seq 1 $LATEST_RUNS); do
+            echo "[latest: $i/$LATEST_RUNS] 测试中..."
+            
+            if sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=16 \
+              -test.run "TestNativeLayer/.*enable_prefetch=true.*nydusd_version=latest.*rafs_mode=direct" \
+              &> /tmp/test_latest_$i.log; then
+              LATEST_SUCCESS=$((LATEST_SUCCESS + 1))
+              echo "  ✅ 成功 (累计: 成功=$LATEST_SUCCESS, 失败=$LATEST_FAILED)"
+            else
+              LATEST_FAILED=$((LATEST_FAILED + 1))
+              echo "  ❌ 失败 (累计: 成功=$LATEST_SUCCESS, 失败=$LATEST_FAILED)"
+              cp /tmp/test_latest_$i.log "$RESULT_DIR/failed_latest_$i.log"
+              
+              # 提取错误类型
+              if grep -q "input/output error" /tmp/test_latest_$i.log; then
+                echo "     错误类型: input/output error"
+              elif grep -q "Not equal" /tmp/test_latest_$i.log; then
+                echo "     错误类型: hash mismatch"
+              fi
+            fi
+            
+            # 每10次输出进度
+            if [ $((i % 10)) -eq 0 ]; then
+              FAIL_RATE=$(awk "BEGIN {printf \"%.1f\", ($LATEST_FAILED/$i)*100}")
+              echo "  📊 进度: $i/$LATEST_RUNS | 失败: $LATEST_FAILED | 失败率: $FAIL_RATE%"
+            fi
+          done
+          
+          LATEST_FAIL_RATE=$(awk "BEGIN {printf \"%.2f\", ($LATEST_FAILED/$LATEST_RUNS)*100}")
+          echo ""
+          echo "latest 测试完成: 成功=$LATEST_SUCCESS, 失败=$LATEST_FAILED, 失败率=$LATEST_FAIL_RATE%"
+          echo ""
+          
+          # ========== 汇总结果 ==========
+          END=$(date +%s)
+          DURATION=$((END - START))
+          
+          TOTAL_FAILED=$((V0_FAILED + LATEST_FAILED))
+          TOTAL_SUCCESS=$((V0_SUCCESS + LATEST_SUCCESS))
+          
+          echo ""
+          echo "========================================="
+          echo "测试结果汇总"
+          echo "========================================="
+          echo "总运行次数: $TOTAL_RUNS"
+          echo "总成功: $TOTAL_SUCCESS"
+          echo "总失败: $TOTAL_FAILED"
+          echo "耗时: ${DURATION}秒 ($((DURATION/60))分钟)"
+          echo ""
+          echo "详细对比:"
+          echo "  v0.1.0 (问题版本):  运行=$V0_RUNS, 成功=$V0_SUCCESS, 失败=$V0_FAILED, 失败率=$V0_FAIL_RATE%"
+          echo "  latest (修复版本):  运行=$LATEST_RUNS, 成功=$LATEST_SUCCESS, 失败=$LATEST_FAILED, 失败率=$LATEST_FAIL_RATE%"
+          echo ""
+          
+          # 计算改善程度
+          if [ $V0_FAILED -gt 0 ] && [ $LATEST_FAILED -eq 0 ]; then
+            echo "✅ 修复效果: 完全解决了间歇性失败问题！"
+          elif [ $V0_FAILED -gt 0 ] && [ $LATEST_FAILED -gt 0 ]; then
+            IMPROVEMENT=$(awk "BEGIN {printf \"%.2f\", (1 - $LATEST_FAIL_RATE/$V0_FAIL_RATE)*100}")
+            echo "⚠️  修复效果: 失败率降低了 $IMPROVEMENT%，但仍有失败"
+          elif [ $V0_FAILED -eq 0 ]; then
+            echo "ℹ️  v0.1.0 未能复现问题，可能需要增加运行次数"
+          fi
+          
+          # 保存状态到文件
+          {
+            echo "total_runs=$TOTAL_RUNS"
+            echo "total_failed=$TOTAL_FAILED"
+            echo "total_success=$TOTAL_SUCCESS"
+            echo "duration=$DURATION"
+            echo "v0_runs=$V0_RUNS"
+            echo "v0_failed=$V0_FAILED"
+            echo "v0_success=$V0_SUCCESS"
+            echo "v0_fail_rate=$V0_FAIL_RATE"
+            echo "latest_runs=$LATEST_RUNS"
+            echo "latest_failed=$LATEST_FAILED"
+            echo "latest_success=$LATEST_SUCCESS"
+            echo "latest_fail_rate=$LATEST_FAIL_RATE"
+          } > "$RESULT_DIR/status.txt"
+          
+          if [ $V0_FAILED -gt 0 ]; then
+            echo "status=reproduced" >> "$RESULT_DIR/status.txt"
+          else
+            echo "status=not_reproduced" >> "$RESULT_DIR/status.txt"
+          fi
+          
+          # 如果 v0.1.0 有失败，退出码为1（表示成功复现了问题）
+          [ $V0_FAILED -gt 0 ]
+      
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          retention-days: 7
+      
+      - name: Summary
+        if: always()
+        run: |
+          RESULT_DIR="${GITHUB_WORKSPACE}/test-results"
+          STATUS_FILE="$RESULT_DIR/status.txt"
+          
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "## ⚠️ 测试结果文件未找到" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          # 读取状态文件
+          . "$STATUS_FILE"
+          
+          echo "## 🧪 间歇性失败对比测试结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 显示总体统计
+          echo "### 📊 总体统计" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 指标 | 数值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 总运行次数 | $total_runs |" >> $GITHUB_STEP_SUMMARY
+          echo "| 总成功次数 | $total_success |" >> $GITHUB_STEP_SUMMARY
+          echo "| 总失败次数 | $total_failed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 总耗时 | ${duration}秒 ($(($duration/60))分钟) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # v0.1.0 结果
+          echo "### 🔴 v0.1.0 (问题版本，未修复)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 指标 | 数值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 运行次数 | $v0_runs |" >> $GITHUB_STEP_SUMMARY
+          echo "| 成功次数 | $v0_success |" >> $GITHUB_STEP_SUMMARY
+          echo "| 失败次数 | $v0_failed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 失败率 | $v0_fail_rate% |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # latest 结果
+          echo "### 🟢 latest (修复版本，已应用 WaitForPrefetchComplete)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 指标 | 数值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 运行次数 | $latest_runs |" >> $GITHUB_STEP_SUMMARY
+          echo "| 成功次数 | $latest_success |" >> $GITHUB_STEP_SUMMARY
+          echo "| 失败次数 | $latest_failed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 失败率 | $latest_fail_rate% |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 对比分析
+          echo "### 📈 修复效果分析" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ $v0_failed -gt 0 ] && [ $latest_failed -eq 0 ]; then
+            echo "✅ **完全解决了间歇性失败问题！**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- v0.1.0 失败率: **$v0_fail_rate%**" >> $GITHUB_STEP_SUMMARY
+            echo "- latest 失败率: **0%**" >> $GITHUB_STEP_SUMMARY
+            echo "- 改善程度: **100%**" >> $GITHUB_STEP_SUMMARY
+          elif [ $v0_failed -gt 0 ] && [ $latest_failed -gt 0 ]; then
+            improvement=$(awk "BEGIN {printf \"%.2f\", (1 - $latest_fail_rate/$v0_fail_rate)*100}")
+            echo "⚠️ **部分解决了问题，但仍有失败**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- v0.1.0 失败率: **$v0_fail_rate%**" >> $GITHUB_STEP_SUMMARY
+            echo "- latest 失败率: **$latest_fail_rate%**" >> $GITHUB_STEP_SUMMARY
+            echo "- 改善程度: **${improvement}%**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ 建议：检查修复代码是否完全生效" >> $GITHUB_STEP_SUMMARY
+          elif [ $v0_failed -eq 0 ]; then
+            echo "ℹ️ **v0.1.0 未能复现问题**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "可能原因：" >> $GITHUB_STEP_SUMMARY
+            echo "- 运行次数不够多（当前: $v0_runs 次）" >> $GITHUB_STEP_SUMMARY
+            echo "- 测试环境差异" >> $GITHUB_STEP_SUMMARY
+            echo "- 间歇性失败概率较低" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 建议：增加运行次数到 100+ 次" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📝 **失败日志已保存在 artifacts 中，请下载查看详情**" >> $GITHUB_STEP_SUMMARY
